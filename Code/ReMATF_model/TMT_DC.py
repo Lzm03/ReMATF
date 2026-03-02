@@ -10,7 +10,7 @@ from einops.layers.torch import Rearrange
 from torchvision.ops import DeformConv2d
 
 from .DefConv import DeformConv3d
-from .nnMamba import nnMambaSeg, nnMambaRefine
+# from .nnMamba import nnMambaSeg
 from .SwinUnet_3D import swinUnet_t_3D
 
 
@@ -423,7 +423,7 @@ class TurbCrossAttention(nn.Module):
         self.dim = dim
         self.num_heads = num_heads
         head_dim = dim // num_heads
-        assert dim % num_heads == 0, 
+        assert dim % num_heads == 0
         self.scale = head_dim ** -0.5
 
         self.q_proj = nn.Linear(dim, dim, bias=bias)
@@ -999,9 +999,9 @@ class TMT_MS(nn.Module):
                 padding=(2, 0, 0),
             )
 
-        if self.mambadef:
+        # if self.mambadef:
             # self.mamba_refine = nnMambaRefine(in_ch=dim*2, hidden_ch=dim*2, blocks=2)
-            self.mamba_refine = nnMambaRefine(in_ch=dim*8, hidden_ch=dim*8, blocks=2)
+            # self.mamba_refine = nnMambaRefine(in_ch=dim*8, hidden_ch=dim*8, blocks=2)
             # self.mamba_conv_in_3d  = nn.Conv3d(dim, 1, kernel_size=1, stride=1, padding=0)
             # self.mamba_conv_out_3d = nn.Conv3d(1, dim*2, kernel_size=1, stride=1, padding=0)
 
@@ -1138,18 +1138,16 @@ class TMT_MS(nn.Module):
                         [turb_level],
                         dtype=inp_enc_l1.dtype,
                         device=inp_enc_l1.device
-                    )  # [1]
-                if turb_level.dim() == 0:   # 标量 tensor
-                    turb_level = turb_level.unsqueeze(0)        # [1]
-                if turb_level.dim() == 1:   # [B]
-                    turb_level = turb_level.unsqueeze(1)        # [B,1]
+                    ) 
+                if turb_level.dim() == 0:  
+                    turb_level = turb_level.unsqueeze(0)      
+                if turb_level.dim() == 1: 
+                    turb_level = turb_level.unsqueeze(1)        
 
-                turb_level = turb_level.to(inp_enc_l1.device, dtype=inp_enc_l1.dtype)  # [B,1]
+                turb_level = turb_level.to(inp_enc_l1.device, dtype=inp_enc_l1.dtype) 
                 B = inp_enc_l1.shape[0]
-                assert turb_level.shape[0] == B, "turb_level batch size mismatch"
-
-                turb_emb = self.turb_embed(turb_level).view(B, -1)   # [B, dim]
-                # Cross-attention: turb_emb 作为 query，全局调制 L1 特征
+                assert turb_level.shape[0] == B
+                turb_emb = self.turb_embed(turb_level).view(B, -1)
                 inp_enc_l1 = self.turb_cross_attn(inp_enc_l1, turb_emb)
             
             inp_enc_l2 = self.getFeature2(inp_img2)
@@ -1160,9 +1158,9 @@ class TMT_MS(nn.Module):
             out_enc_l3, f = self.forward_with_optional_flow(self.encode_l3)(torch.cat([inp_enc_l3, self.down2_3(out_enc_l2)], 1)); flows += f
             embedding, f = self.forward_with_optional_flow(self.embedding)(self.down3_4(out_enc_l3)); flows += f
             
-            if self.mambadef:
-                refine_out = self.mamba_refine(embedding)
-                embedding = embedding + 0.2 * refine_out
+            # if self.mambadef:
+            #     refine_out = self.mamba_refine(embedding)
+            #     embedding = embedding + 0.2 * refine_out
 
             inp_dec_l3 = self.up4_3(embedding)
             inp_dec_l3 = torch.cat([inp_dec_l3, out_enc_l3], 1)
