@@ -20,13 +20,13 @@ from data.dataset_video_train import DataLoaderTurbVideo
 from model.TMT_DC import TMT_MS
 from utils.general import create_log_folder
 from utils.losses import CharbonnierLoss, dwtLoss
-from ultralytics import YOLO
+from utils.clipiqa import ClipIQA
+
 
 import numpy as np
 import cv2
 import torch
 import matplotlib.pyplot as plt
-from ultralytics.utils.ops import non_max_suppression
 import lpips 
 import time 
 
@@ -65,7 +65,7 @@ def get_args():
     parser.add_argument("--tmt_dims", type=int, default=16)
     parser.add_argument("--resume_ckpt", type=str, default=None)
     parser.add_argument("--quick_val", action="store_true")
-    parser.add_argument("--lambda_dwt", type=float, default=0.02)
+    parser.add_argument("--lambda_dwt", type=float, default=0.01)
     parser.add_argument("--train_label_dir", type=str, required=True)
     parser.add_argument("--val_label_dir", type=str, required=True)
     parser.add_argument("--eval_only", action="store_true", help="Only run validation without training")
@@ -81,10 +81,18 @@ def get_args():
                         help="Edge protection strength (reduces 'dynamic degree' near edges to prevent edge blurring).")
     parser.add_argument("--matf_beta", type=float, default=0.8,
                         help="EMA smoothing factor for motion map to suppress frame-wise jitter and improve temporal stability.")
-    parser.add_argument("--lambda_temp", type=float, default=1.0,
+    parser.add_argument("--lambda_temp", type=float, default=0.05,
                         help="Weight for static-aware temporal consistency loss; enforces stronger constraint in static regions.")
     parser.add_argument("--save_motion_vis", action="store_true",
                         help="Save visualization video with overlaid motion maps on the validation set (sequence 0).")
+    parser.add_argument(
+        "--eval_mode",
+        type=str,
+        default="mean",
+        choices=["first", "last", "mean"],
+        help="Evaluation mode for video metrics"
+    )
+
     return parser.parse_args()
 
 def flow_warp(img, flow):
@@ -165,6 +173,17 @@ def save_motion_overlay_video(frames_rgb, motions_01, out_path, fps=25):
         overlay_rgb = (0.6*img + 0.4*heat_bgr[:,:,::-1]).clip(0,255).astype(np.uint8)
         vw.write(overlay_rgb[:,:,::-1])  
     vw.release()
+    
+def save_video_from_uint8_frames(frames_uint8, out_path, fps=25):
+    if len(frames_uint8) == 0:
+        return
+    H, W, _ = frames_uint8[0].shape
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    vw = cv2.VideoWriter(out_path, fourcc, fps, (W, H))
+    for f in frames_uint8:
+        vw.write(f[:, :, ::-1])  # RGB -> BGR
+    vw.release()
+
 
 def test_tensor_img(gt, output, lpips_fn):
     if gt.dim() == 4:
@@ -212,6 +231,26 @@ def get_device():
 def blend_prev_frame(O_prev, T_t, alpha_t):
     return alpha_t * O_prev + (1 - alpha_t) * T_t.detach()
 
+def laplacian(x):
+    if x.dim() == 3:
+        x = x.unsqueeze(0)   
+
+    B, C, H, W = x.shape
+
+    kernel = torch.tensor(
+        [[0, -1, 0],
+         [-1, 4, -1],
+         [0, -1, 0]],
+        dtype=x.dtype,
+        device=x.device
+    ).view(1, 1, 3, 3)
+
+    kernel = kernel.repeat(C, 1, 1, 1)
+
+    return F.conv2d(x, kernel, padding=1, groups=C)
+
+
+
 def main():
     
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -220,8 +259,12 @@ def main():
 
     args = get_args()
     device = get_device()
-    
     lpips_loss_fn = lpips.LPIPS(net='alex').to(device)
+    clip_iqa = ClipIQA("/root/autodl-tmp/iter_80000.pth", device)
+    clip_scores = []
+    
+    
+    
     lpips_loss_fn.eval()
 
     torch.manual_seed(42)
@@ -290,122 +333,6 @@ def main():
     dwt_losses = []
     flow_losses = []
     total_losses = []
-    
-    
-    if args.eval_only:
-        model.eval()
-        psnr_all, ssim_all, lpips_all = [], [], []
-        total_restore_time = 0.0
-        frame_count = 0
-
-        static_consistency_list = []
-
-        with torch.no_grad():
-            for val_data_idx, val_data in enumerate(tqdm(val_loader)):
-                full_seq, target_seq = val_data[0][0].to(device), val_data[1][0].to(device)
-                O_prev = full_seq[0]
-
-                video_outputs = []
-                video_targets = []
-                
-                matf_ema_state = None
-                motion_frames, motion_maps = [], []
-
-                for t in range(1, full_seq.shape[0]):
-                    I_t = full_seq[t]
-                    T_t = target_seq[t]
-
-                    input_cat = torch.stack([O_prev, I_t], dim=0).unsqueeze(0).permute(0, 2, 1, 3, 4)
-
-                    start = time.time()
-                    output, flows = model(input_cat)
-                    end = time.time()
-
-                    total_restore_time += (end - start)
-                    frame_count += 1
-
-                    output = output.squeeze(0)
-                    if output.dim() == 4:
-                        output = output[:, -1, :, :]
-                        
-                    O_hat = output 
-                    if args.matf and (flows is not None) and (len(flows) > 0):
-                        flow_lvl = flows[0]
-                        if flow_lvl.dim() == 5:
-                            flow_lvl = flow_lvl[:, :, 0]
-                        flow_fw = F.interpolate(flow_lvl, size=I_t.shape[-2:], mode='bilinear', align_corners=True)
-
-                        S_t, M_t, Iprev_warp = compute_motion_map(
-                            O_prev.unsqueeze(0), I_t.unsqueeze(0), flow_fw, flow_bw=None,
-                            a=args.matf_a, b=args.matf_b, c=args.matf_c, d=args.matf_d,
-                            ema_prev=matf_ema_state, beta=args.matf_beta
-                        )
-                        matf_ema_state = M_t  
-
-                        S_ch = S_t.squeeze(0).expand_as(output)  # CxHxW
-                        O_hat = S_ch * Iprev_warp.squeeze(0) + (1.0 - S_ch) * output
-
-                        static_consistency = F.l1_loss(S_ch * output, S_ch * Iprev_warp.squeeze(0)).item()
-                        static_consistency_list.append(static_consistency)
-
-                        if args.save_motion_vis and val_data_idx == 0:
-                            motion_frames.append(tensor_to_rgb_uint8(I_t))
-                            motion_maps.append(M_t.squeeze(0).squeeze(0))
-
-                        O_prev = O_hat.detach()
-                    else:
-                        if hasattr(args, "alpha"):
-                            O_prev = args.alpha * O_prev + (1.0 - args.alpha) * output.detach()
-                        else:
-                            O_prev = output.detach()
-
-                    out_eval = O_hat if (args.matf) else output
-                    
-                    video_outputs.append(out_eval.unsqueeze(0))
-                    video_targets.append(T_t.unsqueeze(0))
-
-                    if val_data_idx == 0:
-                        output_dir_epoch = os.path.join(result_img_path, f"eval_only")
-                        os.makedirs(output_dir_epoch, exist_ok=True)
-                        save_image(I_t, os.path.join(output_dir_epoch, f"seq{val_data_idx}_frame{t}_input.png"))
-                        save_image(out_eval, os.path.join(output_dir_epoch, f"seq{val_data_idx}_frame{t}_output.png"))
-                        save_image(T_t, os.path.join(output_dir_epoch, f"seq{val_data_idx}_frame{t}_gt.png"))
-
-                if video_outputs:
-                    video_output = torch.stack(video_outputs, dim=1)  # [1, T, C, H, W]
-                    video_target = torch.stack(video_targets, dim=1)  # [1, T, C, H, W]
-                    
-                    out_frames, psnr_video, ssim_video, lpips_video = test_tensor_img(
-                        video_target, video_output, lpips_loss_fn
-                    )
-                    
-                    psnr_all.append(sum(psnr_video)/len(psnr_video))
-                    ssim_all.append(sum(ssim_video)/len(ssim_video))
-                    lpips_all.append(sum(lpips_video)/len(lpips_video))
-                    
-                    print(f"Video {val_data_idx}: PSNR={psnr_all[-1]:.4f}, SSIM={ssim_all[-1]:.4f}, LPIPS={lpips_all[-1]:.4f}")
-
-                if args.save_motion_vis and args.matf and val_data_idx == 0 and len(motion_frames) > 0:
-                    out_mp4 = os.path.join(result_img_path, f"eval_only_seq0_motion_overlay.mp4")
-                    save_motion_overlay_video(motion_frames, motion_maps, out_mp4, fps=25)
-                    print(f"[VIS] motion overlay saved -> {out_mp4}")
-
-        mean_psnr = np.mean(psnr_all) if len(psnr_all) else 0.0
-        mean_ssim = np.mean(ssim_all) if len(ssim_all) else 0.0
-        mean_lpips = np.mean(lpips_all) if len(lpips_all) else 0.0
-        avg_restore_time = total_restore_time / max(frame_count, 1)
-
-        if len(static_consistency_list) > 0:
-            mean_static_cons = np.mean(static_consistency_list)
-            print(f"[EVAL ONLY] Static-Consistency(L1 on static) : {mean_static_cons:.6f}")
-
-        print(f"[EVAL ONLY] Overall - PSNR: {mean_psnr:.4f}, SSIM: {mean_ssim:.4f}, LPIPS: {mean_lpips:.4f}")
-        print(f"[EVAL ONLY] Avg Restore Time: {avg_restore_time:.4f} sec/frame")
-
-        logging.info(f"[EVAL ONLY] Overall - PSNR: {mean_psnr:.4f}, SSIM: {mean_ssim:.4f}, LPIPS: {mean_lpips:.4f}")
-        logging.info(f"[EVAL ONLY] Avg Restore Time: {avg_restore_time:.4f} sec/frame")
-        return
-
 
     for epoch in range(args.epochs):
         model.train()
@@ -422,7 +349,21 @@ def main():
                 T_t = target_seq[t]
 
                 input_cat = torch.stack([O_prev, I_t], dim=0).unsqueeze(0).permute(0, 2, 1, 3, 4)
-                output, flows = model(input_cat)
+                # === Forward with turbulence-level conditioning ===
+                # (1) run model first to get estimation for turb_level
+                output_temp, _ = model(input_cat)                   
+                output_temp = output_temp.squeeze(0)
+                if output_temp.dim() == 4:
+                    output_temp = output_temp[:, -1, :, :]
+
+                # (2) compute CLIP-IQA score from temporary output
+                out_np = output_temp.detach().clamp(0,1).cpu().numpy().transpose(1,2,0) * 255
+                restored_t = torch.from_numpy(out_np/255.).permute(2,0,1).float().to(device)
+                clip_score = clip_iqa.score_tensor(restored_t)
+                turb_level = 1.0 - clip_score / 100.0
+
+                # (3) forward AGAIN but with turb_level
+                output, flows = model(input_cat, turb_level=turb_level)
                 output = output.squeeze(0)
                 if output.dim() == 4:
                     output = output[:, -1, :, :]
@@ -467,9 +408,13 @@ def main():
                 else:
                     O_hat = output
                     temp_loss = torch.tensor(0.0, device=device)
-
+                
+                lap_loss = F.l1_loss(
+                    laplacian(output),
+                    laplacian(T_t)
+                )
             
-                loss = charb_loss + dwt_loss + lambda_flow * flow_loss + args.lambda_temp * temp_loss
+                loss = charb_loss + 0.15 * lap_loss + dwt_loss + lambda_flow * flow_loss + args.lambda_temp * temp_loss
 
                 train_loss_list.append(loss.item())
                 charb_losses.append(charb_loss.item())
@@ -482,6 +427,8 @@ def main():
                 
                 if args.matf and (flows is not None) and (len(flows) > 0):
                     O_prev = O_hat.detach()
+                else:
+                    O_prev = 0.6 * I_t + 0.4 * output.detach()
         
             if args.quick_val:
                 break
@@ -508,14 +455,30 @@ def main():
                 
                 motion_frames, motion_maps = [], []
                 matf_ema_state = None
+                input_frames = []
+                gt_frames = []
+
 
                 for t in range(1, full_seq.shape[0]):
                     I_t = full_seq[t]
                     T_t = target_seq[t]
 
-                    input_cat = torch.stack([O_prev, I_t], dim=0)  # [2, 3, H, W]
-                    input_cat = input_cat.unsqueeze(0).permute(0, 2, 1, 3, 4)  # [1, 3, 2, H, W]
-                    output, _ = model(input_cat)
+                    input_cat = torch.stack([O_prev, I_t], dim=0).unsqueeze(0).permute(0,2,1,3,4)
+
+                    # first pass
+                    output_temp, _ = model(input_cat)
+                    output_temp = output_temp.squeeze(0)
+                    if output_temp.dim() == 4:
+                        output_temp = output_temp[:, -1, :, :]
+
+                    # compute turb_level
+                    out_np = output_temp.detach().cpu().numpy().transpose(1,2,0) * 255
+                    restored_t = torch.from_numpy(out_np/255.).permute(2,0,1).float().to(device)
+                    clip_score = clip_iqa.score_tensor(restored_t)
+                    turb_level = 1 - clip_score / 100
+
+                    # second pass (real)
+                    output, flows = model(input_cat, turb_level=turb_level)
                     output = output.squeeze(0)
                     if output.dim() == 4:
                         output = output[:, -1, :, :]
@@ -541,31 +504,85 @@ def main():
                             motion_maps.append(M_t.squeeze(0).squeeze(0))
                     else:
                         O_prev = output.detach()
-
+                        
+                    input_frames.append(tensor_to_rgb_uint8(I_t))
+                    gt_frames.append(tensor_to_rgb_uint8(T_t))
                     video_outputs.append(output.unsqueeze(0))
                     video_targets.append(T_t.unsqueeze(0))
 
                     if val_data_idx == 0:
                         output_dir_epoch = os.path.join(result_img_path, f"epoch{epoch}")
                         os.makedirs(output_dir_epoch, exist_ok=True)
-
+                        
                         save_image(I_t, os.path.join(output_dir_epoch, f"seq{val_data_idx}_frame{t}_input.png"))
                         save_image(output, os.path.join(output_dir_epoch, f"seq{val_data_idx}_frame{t}_output.png"))
                         save_image(T_t, os.path.join(output_dir_epoch, f"seq{val_data_idx}_frame{t}_gt.png"))
 
-                if video_outputs:
-                    video_output = torch.stack(video_outputs, dim=1)  # [1, T, C, H, W]
-                    video_target = torch.stack(video_targets, dim=1)  # [1, T, C, H, W]
-                    
-                    out_frames, psnr_video, ssim_video, lpips_video = test_tensor_img(
-                        video_target, video_output, lpips_loss_fn
-                    )
-                    
-                    psnr_all.append(sum(psnr_video)/len(psnr_video))
-                    ssim_all.append(sum(ssim_video)/len(ssim_video))
-                    lpips_all.append(sum(lpips_video)/len(lpips_video))
-                    
-                    print(f"Epoch {epoch}, Video {val_data_idx}: PSNR={psnr_all[-1]:.4f}, SSIM={ssim_all[-1]:.4f}, LPIPS={lpips_all[-1]:.4f}")
+
+                    if video_outputs:
+
+                        video_output = torch.stack(video_outputs, dim=1)
+                        video_target = torch.stack(video_targets, dim=1)
+
+                        out_frames, psnr_video, ssim_video, lpips_video = test_tensor_img(
+                            video_target, video_output, lpips_loss_fn
+                        )
+                        
+                        # ===== CLIP-IQA score for each frame =====
+                        restored = out_frames[-1]  # uint8 HWC
+                        restored_t = torch.from_numpy(restored / 255.).permute(2,0,1).float().to(device)
+
+                        clip_score = clip_iqa.score_tensor(restored_t)
+                        turb_level = 1.0 - clip_score / 100.0
+                        
+                        clip_scores.append(clip_score)
+
+                        if len(psnr_video) > 0:
+
+                            if args.eval_mode == "mean":
+                                psnr_val = sum(psnr_video) / len(psnr_video)
+                                ssim_val = sum(ssim_video) / len(ssim_video)
+                                lpips_val = sum(lpips_video) / len(lpips_video)
+
+                            elif args.eval_mode == "first":
+                                psnr_val = psnr_video[0]
+                                ssim_val = ssim_video[0]
+                                lpips_val = lpips_video[0]
+
+                            elif args.eval_mode == "last":
+                                psnr_val = psnr_video[-1]
+                                ssim_val = ssim_video[-1]
+                                lpips_val = lpips_video[-1]
+
+                            psnr_all.append(psnr_val)
+                            ssim_all.append(ssim_val)
+                            lpips_all.append(lpips_val)
+
+                            print(
+                                f"Video {val_data_idx} [{args.eval_mode}] : "
+                                f"PSNR={psnr_val:.4f}, SSIM={ssim_val:.4f}, LPIPS={lpips_val:.4f}"
+                            )
+    
+                        if val_data_idx == 0:
+                            epoch_dir = os.path.join(result_img_path, f"epoch{epoch}")
+                            os.makedirs(epoch_dir, exist_ok=True)
+
+                            save_video_from_uint8_frames(
+                                out_frames,
+                                os.path.join(epoch_dir, "seq0_output.mp4"),
+                                fps=25
+                            )
+                            save_video_from_uint8_frames(
+                                input_frames,
+                                os.path.join(epoch_dir, "seq0_input.mp4"),
+                                fps=25
+                            )
+
+                            save_video_from_uint8_frames(
+                                gt_frames,
+                                os.path.join(epoch_dir, "seq0_gt.mp4"),
+                                fps=25
+                            )
 
                 if args.save_motion_vis and args.matf and val_data_idx == 0 and len(motion_frames) > 0:
                     out_mp4 = os.path.join(result_img_path, f"epoch{epoch}_seq0_motion_overlay.mp4")
@@ -576,12 +593,17 @@ def main():
         mean_ssim = np.mean(ssim_all) if len(ssim_all) else 0.0
         mean_lpips = np.mean(lpips_all) if len(lpips_all) else 0.0
         current_score = mean_psnr + mean_ssim
+        
+        mean_clip_iqa = np.mean(clip_scores) if len(clip_scores) else 0
+        print(f"[Val@Epoch {epoch}] CLIP-IQA: {mean_clip_iqa:.4f}")
+        logging.info(f"[Val@Epoch {epoch}] CLIP-IQA: {mean_clip_iqa:.4f}")
+        writer.add_scalar("Val/CLIP-IQA", mean_clip_iqa, epoch)
 
         print(f"[Val@Epoch {epoch}] Overall - PSNR: {mean_psnr:.4f}, SSIM: {mean_ssim:.4f}, LPIPS: {mean_lpips:.4f}")
         logging.info(f"[Val@Epoch {epoch}] Overall - PSNR: {mean_psnr:.4f}, SSIM: {mean_ssim:.4f}, LPIPS: {mean_lpips:.4f}")
-        writer.add_scalar("Val/PSNR", mean_psnr, epoch)
-        writer.add_scalar("Val/SSIM", mean_ssim, epoch)
-        writer.add_scalar("Val/LPIPS", mean_lpips, epoch)
+        writer.add_scalar(f"Val/PSNR_{args.eval_mode}", mean_psnr, epoch)
+        writer.add_scalar(f"Val/SSIM_{args.eval_mode}", mean_ssim, epoch)
+        writer.add_scalar(f"Val/LPIPS_{args.eval_mode}", mean_lpips, epoch)
 
         if current_score > best_score:
             best_score = current_score
